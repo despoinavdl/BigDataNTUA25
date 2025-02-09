@@ -169,7 +169,7 @@ result_ds, final_centers = kmeans_ray(
     scaled_ds=scaled_ds,
     feature_columns=feature_cols,
     n_clusters=2,
-    max_iters=10,
+    max_iters=3,
     batch_size=1000
 )
 train_time = time.time() - train_start
@@ -201,3 +201,4 @@ print(f"Loading Time: {load_time}")
 print(f"Preproccessing Time: {preprocessing_time}")
 print(f"Training Time: {train_time}")
 print(f"Total Time: {total_time}")
+
