@@ -1,10 +1,11 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, DoubleType, StringType, IntegerType
 from pyspark.ml.clustering import KMeans
-from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.feature import VectorAssembler, StandardScaler
 import time
 import sys
 
+# Initialize Spark Session with cluster configuration
 spark = SparkSession.builder \
     .appName("KMeansSpark") \
     .master("yarn") \
@@ -35,13 +36,13 @@ schema = StructType([
 
 load_start = time.time()
 data = spark.read.csv(data_path, header=True, schema=schema)
-data = data.repartition(100)
+# data = data.repartition(500)
 # "Registering the DataFrame time" would be more accurate
 # print(f"Data loading time: {load_time:.2f} seconds")/
 
 
 # start_time = time.time()
-data.count()  # Forces Spark to actually load the data
+data.limit(1).show()  # Forces Spark to actually load the data
 # print(f"Actual data loading time: {time.time() - start_time:.2f} seconds")
 load_time = time.time() - load_start
 
@@ -58,21 +59,24 @@ preprocessing_start = time.time()
 numeric_cols = ["num_feature_1", "num_feature_2", "num_feature_3"]
 assembler = VectorAssembler(inputCols=numeric_cols, outputCol="features")
 feature_data = assembler.transform(data).select("features")
-feature_data.cache()
-# print(f"Data preprocessing time: {preprocess_time:.2f} seconds")
-preprocessing_time = time.time() - preprocessing_start
 
+# Apply StandardScaler
+scaler = StandardScaler(inputCol="features", outputCol="scaled_features", withMean=True, withStd=True)
+scaler_model = scaler.fit(feature_data)
+scaled_data = scaler_model.transform(feature_data).select("scaled_features")
+
+preprocessing_time = time.time() - preprocessing_start
 # Train K-Means model
 train_start = time.time()
 kmeans = KMeans() \
     .setK(2) \
-    .setMaxIter(10) \
-    .setFeaturesCol("features") \
+    .setMaxIter(3) \
+    .setFeaturesCol("scaled_features") \
     .setPredictionCol("prediction") \
     .setSeed(42) \
     .setInitMode("k-means||")
 
-model = kmeans.fit(feature_data)
+model = kmeans.fit(scaled_data)
 train_time = time.time() - train_start
 # print(f"Model training time: {train_time:.2f} seconds")
 
@@ -90,10 +94,16 @@ for i, center in enumerate(centers):
     print(f"Cluster {i}: {center}")
 
 # Make predictions on the dataset
-predictions = model.transform(feature_data)
+predictions = model.transform(scaled_data)
 cluster_sizes = predictions.groupBy("prediction").count().orderBy("prediction")
 print("\nCluster Sizes:")
 cluster_sizes.show()
+
+# Save model to HDFS
+# start_time = time.time()
+# model.write().overwrite().save(save_path)
+# save_time = time.time() - start_time
+# print(f"Model saving time: {save_time:.2f} seconds")
 
 # Stop Spark Session
 spark.stop()
