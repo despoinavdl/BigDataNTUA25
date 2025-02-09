@@ -1,136 +1,203 @@
 import ray
-import time
 import numpy as np
-import subprocess
+import pandas as pd  # Add this at the top with other imports
+from typing import List, Dict, Tuple, Any
+from ray.data.preprocessors import StandardScaler
+from ray.data import Dataset
+import logging
+import time
+import sys
+from pyarrow import fs
+import pyarrow.csv as csv  # Add this import
+import pyarrow.dataset as ds  # And this one
+import os
 
-def read_hdfs_file_subprocess(hdfs_path):
-    process = subprocess.Popen(["hdfs", "dfs", "-cat", hdfs_path], stdout=subprocess.PIPE, text=True)
-    for line in process.stdout:
-        yield line.strip()
-    process.stdout.close()
-    process.wait()
+classpath = os.popen('hadoop classpath --glob').read().strip()
+os.environ["CLASSPATH"] = classpath
 
-@ray.remote
-def process_chunk(lines):
-    data = []
-    for line in lines:
-        if line.startswith("num_feature"):
-            continue
-        values = line.split(',')
-        if len(values) >= 3:
-            try:
-                features = [float(values[0]), float(values[1]), float(values[2])]
-                data.append(features)
-            except ValueError:
-                continue
-    return np.array(data)
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-@ray.remote
-def compute_closest_centers(points, centers):
-    assignments = []
-    costs = []
-    for point in points:
-        min_dist = float('inf')
-        closest_center = 0
-        for i, center in enumerate(centers):
-            dist = np.sum((point - center) ** 2)
-            if dist < min_dist:
-                min_dist = dist
-                closest_center = i
-        assignments.append(closest_center)
-        costs.append(min_dist)
-    return np.array(assignments), np.array(costs)
+def find_nearest_center(batch: Dict[str, np.ndarray], centers: List[np.ndarray]):
+    """
+    Assign each point in the batch to nearest center using vectorized operations.
+    
+    Args:
+        batch: Dictionary containing feature arrays
+        centers: List of center coordinates
+    
+    Returns:
+        Updated batch with cluster assignments
+    """
+    features = np.column_stack([batch[f] for f in batch.keys() if f != 'cluster'])
+    distances = np.array([np.sum((features - c) ** 2, axis=1) for c in centers])
+    batch['cluster'] = np.argmin(distances, axis=0)
+    return batch
 
-@ray.remote
-def compute_new_centers(points, assignments, k):
+from ray.data import DataContext
+# Disable tensor casting
+ctx = DataContext.get_current()
+ctx.enable_tensor_extension_casting = False
+
+def update_centers(dataset: Dataset, n_clusters: int, n_features: int):
+    """
+    Calculate new center positions using groupby aggregation
+    """
+    def sum_points(df):
+        sums = []
+        counts = []
+        clusters = []
+        
+        for i in range(n_clusters):
+            mask = df['cluster'] == i
+            if np.any(mask):
+                features = df[mask][[col for col in df.columns if col != 'cluster']]
+                sums.append(features.sum().values)
+                counts.append(mask.sum())
+                clusters.append(i)
+                
+        return pd.DataFrame({
+            'cluster': clusters,
+            'sum': sums,
+            'count': counts
+        })
+
+    # Aggregate results
+    result_df = dataset.map_batches(
+        sum_points,
+        batch_format="pandas"
+    ).to_pandas()
+    
+    # Calculate centers
     centers = []
-    for i in range(k):
-        mask = assignments == i
-        if np.any(mask):
-            center = np.mean(points[mask], axis=0)
-            centers.append(center)
+    for i in range(n_clusters):
+        cluster_data = result_df[result_df['cluster'] == i]
+        if not cluster_data.empty:
+            total_sum = np.sum(np.stack(cluster_data['sum'].values), axis=0)
+            total_count = cluster_data['count'].sum()
+            centers.append(total_sum / total_count)
         else:
-            centers.append(points[np.random.randint(len(points))])
-    return np.array(centers)
-
-def distributed_kmeans(data, k=10, max_iterations=20, tolerance=1e-4):
-    n_points = len(data)
-    centers = data[np.random.choice(n_points, k, replace=False)]
-    
-    n_chunks = int(ray.available_resources()['CPU'])
-    chunk_size = len(data) // n_chunks
-    chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
-    
-    for iteration in range(max_iterations):
-        futures = [compute_closest_centers.remote(chunk, centers) for chunk in chunks]
-        try:
-            results = ray.get(futures)
-        except Exception as e:
-            print(f"Error during computation: {e}")
-            ray.shutdown()
-            raise e
+            centers.append(np.zeros(n_features))
             
-        assignments = np.concatenate([r[0] for r in results])
-        costs = np.concatenate([r[1] for r in results])
-        total_cost = np.sum(costs)
+    return centers
+
+def kmeans_ray(scaled_ds: Dataset, feature_columns: List[str], n_clusters: int = 2, max_iters: int = 10, batch_size: int = 10000):
+    """
+    Perform K-means clustering using Ray.
+    
+    Args:
+        scaled_ds: Input Ray dataset
+        feature_columns: List of feature column names
+        n_clusters: Number of clusters
+        max_iters: Maximum number of iterations
+        batch_size: Batch size for processing
+    
+    Returns:
+        Tuple of (clustered dataset, final centers)
+    """
+    
+    # Initialize centers randomly
+    initial_points = scaled_ds.take(n_clusters)
+    centers = [np.array([point[col] for col in feature_columns]) 
+                for point in initial_points]
+    
+    logger.info(f"Initial centers: {centers}")
+    
+    # Main clustering loop
+    for iteration in range(max_iters):
+        # Assign points to clusters
+        clustered_ds = scaled_ds.map_batches(
+            lambda batch: find_nearest_center(batch, centers),
+            batch_format="pandas",
+            batch_size=batch_size
+        )
         
-        new_centers = ray.get(compute_new_centers.remote(data, assignments, k))
-        center_shift = np.sum((centers - new_centers) ** 2)
-        centers = new_centers
+        # Update centers
+        new_centers = update_centers(
+            clustered_ds,
+            n_clusters,
+            len(feature_columns)
+        )
         
-        print(f"Iteration {iteration + 1}, Cost: {total_cost:.2f}")
-        
-        if center_shift < tolerance:
+        # Check convergence
+        if np.allclose(centers, new_centers, rtol=1e-5):
+            logger.info(f"Converged after {iteration + 1} iterations")
             break
             
-    return centers, assignments, total_cost
+        centers = new_centers
+        logger.info(f"Iteration {iteration + 1} completed")
+    
+    return clustered_ds, centers
 
-ray.init(address="auto")
 
-index = "1"
-data_path = f"/datasets/dummy-data-{index}.csv"
-save_path = f"/kmeans/kmeans-model-ray-{index}"
+ray.init()
 
-start_time = time.time()
-chunk_size = 1000
-lines = []
-chunk_futures = []
+# Read data from HDFS
+load_start = time.time()
+feature_cols = ['num_feature_1', 'num_feature_2', 'num_feature_3']
+index = sys.argv[1]
+try:
+    # Create HDFS filesystem - simpler version
+    hdfs_fs = fs.HadoopFileSystem.from_uri("hdfs://okeanos-master:54310")
+    
+    index = sys.argv[1]
+    hdfs_path = f"/datasets/dummy-data-{index}.csv"
+    
+    # Read CSV using Ray with the filesystem, without block_size
+    ds = ray.data.read_csv(
+        hdfs_path,
+        filesystem=hdfs_fs
+    )
+    
+except Exception as e:
+    logger.error(f"Error reading CSV from HDFS: {str(e)}")
+    ray.shutdown()
+    sys.exit(1)
 
-for line in read_hdfs_file_subprocess(data_path):
-    lines.append(line)
-    if len(lines) >= chunk_size:
-        chunk_futures.append(process_chunk.remote(lines))
-        lines = []
+load_time = time.time() - load_start
+preprocessing_start = time.time()
+ds = ds.select_columns(["num_feature_1", "num_feature_2", "num_feature_3"])
+# Normalize features
+scaler = StandardScaler(columns=feature_cols)
+scaled_ds = scaler.fit_transform(ds)
+preprocessing_time = time.time() - preprocessing_start
 
-if lines:
-    chunk_futures.append(process_chunk.remote(lines))
+train_start = time.time()
+# Run clustering
+result_ds, final_centers = kmeans_ray(
+    scaled_ds=scaled_ds,
+    feature_columns=feature_cols,
+    n_clusters=2,
+    max_iters=10,
+    batch_size=1000
+)
+train_time = time.time() - train_start
 
-processed_chunks = ray.get(chunk_futures)
-feature_array = np.concatenate(processed_chunks)
-load_time = time.time() - start_time
-print(f"Data loading time: {load_time:.2f} seconds")
+# Show results
+logger.info(f"Final centers: {final_centers}")
+result_ds.show()
 
-start_time = time.time()
-centers, assignments, wssse = distributed_kmeans(feature_array, k=10, max_iterations=20)
-train_time = time.time() - start_time
-print(f"Training time: {train_time:.2f} seconds")
-print(f"WSSSE: {wssse:.2f}")
 
-print("\nCluster Centers:")
-for i, center in enumerate(centers):
-    print(f"Cluster {i}: {center}")
+total_time = load_time + preprocessing_time + train_time
 
-unique, counts = np.unique(assignments, return_counts=True)
-print("\nCluster Sizes:")
-for cluster, count in zip(unique, counts):
-    print(f"Cluster {cluster}: {count}")
+try:
+    time.sleep(2)
+    ray.shutdown()
+except:
+    pass
 
-start_time = time.time()
-model_data = {"centers": centers, "wssse": wssse}
-np.save("kmeans_model.npy", model_data)
-subprocess.run(["hdfs", "dfs", "-put", "-f", "kmeans_model.npy", save_path])
-subprocess.run(["rm", "kmeans_model.npy"])
-save_time = time.time() - start_time
-print(f"Model saving time: {save_time:.2f} seconds")
+f = open(f"/home/user/kmeans/results/kmeans-ray-data-{index}.output", "w")
+f.write(f"Loading Time: {load_time}\n")
+f.write(f"Preproccessing Time: {preprocessing_time}\n")
+f.write(f"Training Time: {train_time}\n")
+f.write(f"Total Time: {total_time}\n")
+f.close()
 
-ray.shutdown()
+time.sleep(1)
+
+
+print(f"Loading Time: {load_time}")
+print(f"Preproccessing Time: {preprocessing_time}")
+print(f"Training Time: {train_time}")
+print(f"Total Time: {total_time}")
