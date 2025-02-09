@@ -1,10 +1,9 @@
+from pyspark import SparkContext
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.ml.classification import RandomForestClassifier
 from pyspark.sql import SparkSession
-from pyspark import SparkContext
 from pyspark.sql.functions import col, length
-from pyspark.ml.feature import MinMaxScaler
-from pyspark.ml import Pipeline
-from pyspark.ml.feature import VectorAssembler
 import os
 import sys
 import time
@@ -44,7 +43,10 @@ load_time = time.time() - load_start
 df = df.withColumn(
     "new_feature", 
     col("num_feature_1") + length(col("category_1"))
-).filter(col("new_feature") > 5)
+).filter(
+    (col("new_feature") > 11) & 
+    (col("num_feature_2") + col("num_feature_3") < 0.2)
+)
  
 # rows_after = df.count()
 
@@ -53,16 +55,16 @@ preprocessing_start = time.time()
 df = df.select(df.num_feature_1, df.num_feature_2, df.num_feature_3, df.new_feature, df.label)
 
 assembler = VectorAssembler(inputCols=["num_feature_1", "num_feature_2", "num_feature_3", "new_feature"], outputCol="input")
-scaler = MinMaxScaler(inputCol="input", outputCol="features")
+scaler = StandardScaler(inputCol="input", outputCol="features")
 pipeline = Pipeline(stages=[assembler, scaler])
 scalerModel = pipeline.fit(df)
 scaledData = scalerModel.transform(df).select(["features", "label"])
 
-trainingData, testData = scaledData.randomSplit(weights= [0.7,0.3], seed=100)
+trainingData, testData = scaledData.randomSplit(weights= [0.7,0.3], seed=42)
 
 preprocessing_time = time.time() - preprocessing_start
 
-rf = RandomForestClassifier(labelCol="label", featuresCol="features", numTrees=5)
+rf = RandomForestClassifier(labelCol="label", featuresCol="features", numTrees=4, maxDepth=3)
 
 # Chain indexers and forest in a Pipeline
 pipeline = Pipeline(stages=[rf])
@@ -80,6 +82,14 @@ total_time = load_time + preprocessing_time + train_time
 # Stop Spark
 sc.stop()
 
+f = open(f"/home/user/rfc/results/rfc-spark-data-{index}.output", "w")
+# f.write(f"Number of rows before filtering: {rows_before}\n")
+# f.write(f"Number of rows after filtering: {rows_after}\n")
+f.write(f"Loading Time: {load_time}\n")
+f.write(f"Preproccessing Time: {preprocessing_time}\n")
+f.write(f"Training Time: {train_time}\n")
+f.write(f"Total Time: {total_time}\n")
+f.close()
 # print(f"Number of rows before filtering: {rows_before}")
 # print(f"Number of rows after filtering: {rows_after}")
 print(f"Loading Time: {load_time}")
