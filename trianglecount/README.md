@@ -4,7 +4,7 @@ spark-submit \
   --deploy-mode cluster \
   --name TriangleSpark \
 --py-files graphframes.zip \
-  --num-executors 2 \
+  --num-executors <executor_instances> \
   --executor-cores 3 \
   --executor-memory 4G \
   --conf spark.scheduler.mode=FAIR \
