@@ -3,7 +3,7 @@ spark-submit \
   --master yarn \
   --deploy-mode cluster \
   --name KMeansSpark \
-  --num-executors 2 \
+  --num-executors <executor_instances> \
   --executor-cores 3\
   --executor-memory 4G \
   --conf spark.scheduler.mode=FAIR \
